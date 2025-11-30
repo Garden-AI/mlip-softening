@@ -10,3 +10,16 @@ Our collaborators will generate appropriate labeled data for different datasets 
 The Modal script in proof-of-concept/softening_repro.py is a good starting point for this. It shows how to load a model, iterate over an input file, and calculate the softening factor.
 
 Note that the "MatGL-hosted foundation potentials" are in flux at the moment as they are being migrated to a new backend. We may want to save those for last.
+
+UPDATE:
+
+We have successfully set up all the models that we want for the first pass in the runnable-models directory. We currently have working:
+- esen_30m_oam in esen-main.py
+- UMA in uma-softening.py
+- TensorNet-MatPES-PBE-v2025.1-PES in tensornet_softening.py
+- MACE variants like MACE-MatPES-PBE-0 in softening_repro.py
+- mattersim-v1.0.0-5M in mattersim_softening.py
+
+Now it is time to step back and factor out the regression logic from the model-specific code. 
+There are a few ways we can approach this, let's discuss.
+
