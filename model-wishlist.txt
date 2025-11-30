@@ -1,0 +1,5 @@
+eSEN-30M-OAM (fairchem) link: https://github.com/facebookresearch/fairchem
+Several of the MACE foundation potentials, notably MACE-MPA-0, MACE-OMAT-0, and MACE-MatPES-PBE-0 link: https://github.com/ACEsuit/mace-foundations
+UMA (fairchem) link: https://github.com/facebookresearch/fairchem
+Several of the MatGL-hosted foundation potentials, notably TensorNet-MatPES-PBE, M3GNet-MatPES-PBE, CHGNet-MatPES-PBE as well as their MPtrj variants link: https://github.com/materialsvirtuallab/matgl
+MatterSim (Microsoft) link: https://github.com/microsoft/mattersim
