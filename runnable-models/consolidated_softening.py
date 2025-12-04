@@ -141,6 +141,8 @@ def run_softening_analysis(calculator, data: dict) -> dict:
     all_dft_forces = []
     all_model_forces = []
     
+    per_material_results = {}
+    
     # Count total structures for progress bar
     total_structs = sum(len(v) for v in data.values() if isinstance(v, dict))
     print(f"Found {len(data)} WBM groups ({total_structs} total structures). Processing...", file=sys.stderr)
@@ -149,6 +151,9 @@ def run_softening_analysis(calculator, data: dict) -> dict:
     for wbm_id, wbm_data in data.items():
         if not isinstance(wbm_data, dict):
             continue
+            
+        material_dft_forces = []
+        material_model_forces = []
 
         # Iterate through the nested dictionary (e.g., "wbm-5-9051-8")
         for struct_id, entry in wbm_data.items():
@@ -174,6 +179,10 @@ def run_softening_analysis(calculator, data: dict) -> dict:
                 all_dft_forces.append(dft_forces.flatten())
                 all_model_forces.append(model_forces.flatten())
                 
+                # Store for per-material regression
+                material_dft_forces.append(dft_forces.flatten())
+                material_model_forces.append(model_forces.flatten())
+                
                 num_structures += 1
                 
                 if num_structures % 100 == 0:
@@ -183,13 +192,39 @@ def run_softening_analysis(calculator, data: dict) -> dict:
                 # Only print first few errors to avoid log spam
                 if num_structures < 5:
                     print(f"Error processing {wbm_id}/{struct_id}: {e}. Skipping.", file=sys.stderr)
+        
+        # Calculate per-material statistics if we have data for this material
+        if material_dft_forces:
+            try:
+                mat_y_true = np.concatenate(material_dft_forces)
+                mat_y_pred = np.concatenate(material_model_forces)
+                
+                mat_X = mat_y_true.reshape(-1, 1)
+                mat_y = mat_y_pred.reshape(-1, 1)
+                
+                mat_reg = LinearRegression().fit(mat_X, mat_y)
+                mat_slope = mat_reg.coef_[0][0]
+                mat_mae = mean_absolute_error(mat_y_true, mat_y_pred)
+                
+                # cMAE
+                mat_y_pred_corrected = mat_y_pred / mat_slope
+                mat_cmae = mean_absolute_error(mat_y_true, mat_y_pred_corrected)
+                
+                per_material_results[wbm_id] = {
+                    "slope": float(mat_slope),
+                    "mae": float(mat_mae),
+                    "cmae": float(mat_cmae),
+                    "num_structures": len(material_dft_forces)
+                }
+            except Exception as e:
+                print(f"Error calculating stats for {wbm_id}: {e}", file=sys.stderr)
     
     if num_structures == 0:
         print("Error: No valid structures were processed from the input data.", file=sys.stderr)
         return {}
 
     print(f"Processing complete. {num_structures} total sub-structures processed.", file=sys.stderr)
-    print("Performing linear regression...", file=sys.stderr)
+    print("Performing aggregate linear regression...", file=sys.stderr)
 
     # Concatenate all force components into single 1D arrays
     y_true_all = np.concatenate(all_dft_forces) # DFT forces (X-axis)
@@ -220,6 +255,7 @@ def run_softening_analysis(calculator, data: dict) -> dict:
         "cmae": float(cmae),
         "num_structures": int(num_structures),
         "num_force_components": int(len(y_true_all)),
+        "per_material_results": per_material_results
     }
 
 # ==============================================================================
@@ -244,7 +280,7 @@ class MaceModel:
         model_arg = MACE_VARIANTS.get(variant, variant)
         print(f"Loading MACE model: {variant} ({model_arg})", file=sys.stderr)
         
-        self.calc = mace_mp(model=model_arg, default_dtype="float32", device='cuda')
+        self.calc = mace_mp(model=model_arg, default_dtype="float64", device='cuda')
         self.current_variant = variant
 
     @modal.method()
@@ -436,7 +472,7 @@ class MatterSimModel:
 # ==============================================================================
 
 @app.local_entrypoint()
-def main(model: str = "mace", file: str = "WBM_high_energy_states.json", variant: str = None):
+def main(model: str = "mace", file: str = "WBM_high_energy_states.json", variant: str = None, output: str = None):
     """
     Run softening analysis for a specific model.
     
@@ -444,6 +480,7 @@ def main(model: str = "mace", file: str = "WBM_high_energy_states.json", variant
         model: Model family (mace, esen, uma, tensornet, mattersim)
         file: Path to local JSON file to load and pass to the remote function (default: WBM_high_energy_states.json)
         variant: Specific model variant/name to load. Defaults vary by model family.
+        output: Path to save the result JSON. If None, defaults to {model}_{variant}_results.json
     """
     import json
     import os
@@ -492,5 +529,20 @@ def main(model: str = "mace", file: str = "WBM_high_energy_states.json", variant
         print(f"Slope: {result['slope']:.4f} (Softening Factor)")
         print(f"MAE: {result['mae']:.4f}")
         print(f"cMAE: {result['cmae']:.4f}")
+        
+        per_mat = result.get('per_material_results', {})
+        print(f"\n--- Per-Material Results (First 5 of {len(per_mat)}) ---")
+        for i, (mid, stats) in enumerate(per_mat.items()):
+            if i >= 5: break
+            print(f"{mid}: Slope={stats['slope']:.3f}, MAE={stats['mae']:.3f}, cMAE={stats['cmae']:.3f}")
+            
+        # Save results to file
+        if output is None:
+            output = f"{model}_{variant.replace('/', '_')}_results.json"
+            
+        print(f"\nSaving results to {output}...")
+        with open(output, 'w') as f:
+            json.dump(result, f, indent=2)
+        print("Done.")
     else:
         print("No results returned.")
