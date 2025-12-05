@@ -7,8 +7,12 @@ import sys
 app = modal.App("consolidated-softening-app")
 
 CACHE_DIR = "/data"
+FAIRCHEM_CACHE_DIR = "/root/.cache/fairchem"
 WEIGHTS_AND_DATA_VOLUME = modal.Volume.from_name(
     "softening-volume", create_if_missing=True
+)
+HF_CACHE_VOLUME = modal.Volume.from_name(
+    "hf-cache-volume", create_if_missing=True
 )
 
 # ==============================================================================
@@ -420,38 +424,35 @@ class EsenModel:
         loaded_data = load_data(input_json_url, CACHE_DIR, volume=WEIGHTS_AND_DATA_VOLUME)
         return run_softening_analysis(self.calc, loaded_data)
 
-@app.cls(image=UMA_IMAGE, volumes={CACHE_DIR: WEIGHTS_AND_DATA_VOLUME}, timeout=3600, gpu="T4")
+@app.cls(image=UMA_IMAGE, volumes={CACHE_DIR: WEIGHTS_AND_DATA_VOLUME, FAIRCHEM_CACHE_DIR: HF_CACHE_VOLUME}, timeout=3600, gpu="T4")
 class UmaModel:
     @modal.enter()
     def setup(self):
         self.calc = None
+        self.predictor = None
         self.current_model_name = None
 
     def _load_model(self, model_name: str):
         if self.calc is not None and self.current_model_name == model_name:
             return
 
-        import torch
         import os
         import sys
+        import torch
         from fairchem.core import FAIRChemCalculator, pretrained_mlip
-        
-        # Reload volume to check for existing cached weights
-        WEIGHTS_AND_DATA_VOLUME.reload()
-        
-        # Configure HF to store cache in the volume
-        os.environ["HF_HOME"] = CACHE_DIR
         
         print(f"Loading UMA model: {model_name}...", file=sys.stderr)
         
-        # This will download to CACHE_DIR if not present
-        self.predictor = pretrained_mlip.get_predict_unit(model_name, device="cuda" if torch.cuda.is_available() else "cpu")
+        # Attempt to load from cache
+        try:
+            self.predictor = pretrained_mlip.get_predict_unit(model_name, device="cuda" if torch.cuda.is_available() else "cpu")
+            print("Loaded UMA model from cache", file=sys.stderr)
+        except Exception as e:
+            print(f"Failed to load UMA model: {e}", file=sys.stderr)
+            raise e
+        
         self.calc = FAIRChemCalculator(self.predictor, task_name="omat")
         self.current_model_name = model_name
-        
-        # Persist downloaded weights to the volume
-        WEIGHTS_AND_DATA_VOLUME.commit()
-        print("UMA model weights committed to volume.", file=sys.stderr)
 
     @modal.method()
     def calculate_softening_factor(self, input_json_url: str = "https://figshare.com/ndownloader/files/50005317", model_name: str = "uma-s-1p1") -> dict:
