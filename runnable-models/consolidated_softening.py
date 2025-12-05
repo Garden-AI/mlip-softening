@@ -118,8 +118,63 @@ MATTERSIM_IMAGE = (
 )
 
 # ==============================================================================
-# SHARED UTILITY FUNCTION
+# SHARED UTILITY FUNCTIONS
 # ==============================================================================
+
+def load_data(input_json_url: str, cache_dir: str, volume: modal.Volume) -> dict:
+    """
+    Loads data from a URL.
+    
+    Args:
+        input_json_url: A string URL pointing to a JSON file.
+        cache_dir: Directory to cache downloaded files (e.g. /data).
+        volume: Modal Volume object to perform reload/commit operations.
+        
+    Returns:
+        The loaded data dictionary.
+    """
+    import json
+    import os
+    import hashlib
+    import urllib.request
+    import sys
+
+    if not isinstance(input_json_url, str):
+        raise ValueError(f"Invalid input type: {type(input_json_url)}. Expected str (URL).")
+    
+    # Reload volume to ensure we see latest changes from other containers
+    volume.reload()
+    
+    # Specific handling for the default URL to have a clean filename
+    if input_json_url == "https://figshare.com/ndownloader/files/50005317":
+        filename = "WBM_high_energy_states.json"
+    else:
+        # Generate a filename from the URL hash to avoid collisions
+        url_hash = hashlib.md5(input_json_url.encode('utf-8')).hexdigest()
+        filename = f"data_{url_hash}.json"
+        
+    file_path = os.path.join(cache_dir, filename)
+    
+    if not os.path.exists(file_path):
+        print(f"Downloading data from {input_json_url} to {file_path}...", file=sys.stderr)
+        try:
+            urllib.request.urlretrieve(input_json_url, file_path)
+            print("Download complete.", file=sys.stderr)
+            
+            # Commit changes to volume so other containers can see the file
+            volume.commit()
+            print("Volume committed.", file=sys.stderr)
+                
+        except Exception as e:
+            print(f"Failed to download data: {e}", file=sys.stderr)
+            raise
+    else:
+        print(f"Using cached data file: {file_path}", file=sys.stderr)
+        
+    print(f"Loading JSON from {file_path}...", file=sys.stderr)
+    with open(file_path, 'r') as f:
+        return json.load(f)
+
 
 def run_softening_analysis(calculator, data: dict) -> dict:
     """
@@ -284,9 +339,10 @@ class MaceModel:
         self.current_variant = variant
 
     @modal.method()
-    def calculate_softening_factor(self, data: dict, model_name: str) -> dict:
+    def calculate_softening_factor(self, input_json_url: str = "https://figshare.com/ndownloader/files/50005317", model_name: str = "MACE-MP-0") -> dict:
         self._load_model(model_name)
-        return run_softening_analysis(self.calc, data)
+        loaded_data = load_data(input_json_url, CACHE_DIR, volume=WEIGHTS_AND_DATA_VOLUME)
+        return run_softening_analysis(self.calc, loaded_data)
 
 @app.cls(image=FAIRCHEM_IMAGE, volumes={CACHE_DIR: WEIGHTS_AND_DATA_VOLUME}, timeout=3600, gpu="T4")
 class EsenModel:
@@ -352,9 +408,10 @@ class EsenModel:
         self.current_model_name = model_name
 
     @modal.method()
-    def calculate_softening_factor(self, data: dict, model_name: str) -> dict:
+    def calculate_softening_factor(self, input_json_url: str = "https://figshare.com/ndownloader/files/50005317", model_name: str = "esen_30m_oam.pt") -> dict:
         self._load_model(model_name)
-        return run_softening_analysis(self.calc, data)
+        loaded_data = load_data(input_json_url, CACHE_DIR, volume=WEIGHTS_AND_DATA_VOLUME)
+        return run_softening_analysis(self.calc, loaded_data)
 
 @app.cls(image=UMA_IMAGE, volumes={CACHE_DIR: WEIGHTS_AND_DATA_VOLUME}, timeout=3600, gpu="T4") #, secrets=[modal.Secret.from_name("huggingface-secret")])
 class UmaModel:
@@ -380,9 +437,10 @@ class UmaModel:
         self.current_model_name = model_name
 
     @modal.method()
-    def calculate_softening_factor(self, data: dict, model_name: str) -> dict:
+    def calculate_softening_factor(self, input_json_url: str = "https://figshare.com/ndownloader/files/50005317", model_name: str = "uma-m-1p1") -> dict:
         self._load_model(model_name)
-        return run_softening_analysis(self.calc, data)
+        loaded_data = load_data(input_json_url, CACHE_DIR, volume=WEIGHTS_AND_DATA_VOLUME)
+        return run_softening_analysis(self.calc, loaded_data)
 
 @app.cls(image=TENSORNET_IMAGE, volumes={CACHE_DIR: WEIGHTS_AND_DATA_VOLUME}, timeout=3600, gpu="T4")
 class TensorNetModel:
@@ -405,9 +463,10 @@ class TensorNetModel:
         self.current_model_name = model_name
 
     @modal.method()
-    def calculate_softening_factor(self, data: dict, model_name: str) -> dict:
+    def calculate_softening_factor(self, input_json_url: str = "https://figshare.com/ndownloader/files/50005317", model_name: str = "TensorNet-MatPES-PBE-v2025.1-PES") -> dict:
         self._load_model(model_name)
-        return run_softening_analysis(self.calc, data)
+        loaded_data = load_data(input_json_url, CACHE_DIR, volume=WEIGHTS_AND_DATA_VOLUME)
+        return run_softening_analysis(self.calc, loaded_data)
 
 @app.cls(image=MATTERSIM_IMAGE, volumes={CACHE_DIR: WEIGHTS_AND_DATA_VOLUME}, timeout=3600, gpu="T4")
 class MatterSimModel:
@@ -463,22 +522,23 @@ class MatterSimModel:
         self.current_model_name = model_name
 
     @modal.method()
-    def calculate_softening_factor(self, data: dict, model_name: str) -> dict:
+    def calculate_softening_factor(self, input_json_url: str = "https://figshare.com/ndownloader/files/50005317", model_name: str = "mattersim-v1.0.0-5M.pth") -> dict:
         self._load_model(model_name)
-        return run_softening_analysis(self.calc, data)
+        loaded_data = load_data(input_json_url, CACHE_DIR, volume=WEIGHTS_AND_DATA_VOLUME)
+        return run_softening_analysis(self.calc, loaded_data)
 
 # ==============================================================================
 # ENTRYPOINT
 # ==============================================================================
 
 @app.local_entrypoint()
-def main(model: str = "mace", file: str = "WBM_high_energy_states.json", variant: str = None, output: str = None):
+def main(model: str = "mace", input_json_url: str = None, variant: str = None, output: str = None):
     """
     Run softening analysis for a specific model.
     
     Args:
         model: Model family (mace, esen, uma, tensornet, mattersim)
-        file: Path to local JSON file to load and pass to the remote function (default: WBM_high_energy_states.json)
+        input_json_url: URL to remote JSON file. If None, defaults to the Figshare URL via the remote function.
         variant: Specific model variant/name to load. Defaults vary by model family.
         output: Path to save the result JSON. If None, defaults to {model}_{variant}_results.json
     """
@@ -495,30 +555,30 @@ def main(model: str = "mace", file: str = "WBM_high_energy_states.json", variant
         elif model == "tensornet": variant = "TensorNet-MatPES-PBE-v2025.1-PES"
         elif model == "mattersim": variant = "mattersim-v1.0.0-5M.pth"
     
-    print(f"Loading local data from {file}...")
-    try:
-        with open(file, 'r') as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        print(f"Error: File not found at {file}")
-        return
-    except json.JSONDecodeError:
-        print(f"Error: Could not decode JSON from {file}")
-        return
+    # Handle data input
+    if input_json_url:
+        print(f"Using remote data URL: {input_json_url}")
+    else:
+        print("No input URL specified. Using default remote URL.")
 
     print(f"Running softening analysis for model: {model}, variant: {variant}")
     
+    # Prepare kwargs
+    kwargs = {"model_name": variant}
+    if input_json_url is not None:
+        kwargs["input_json_url"] = input_json_url
+        
     result = None
     if model == "mace":
-        result = MaceModel().calculate_softening_factor.remote(data=data, model_name=variant)
+        result = MaceModel().calculate_softening_factor.remote(**kwargs)
     elif model == "esen":
-        result = EsenModel().calculate_softening_factor.remote(data=data, model_name=variant)
+        result = EsenModel().calculate_softening_factor.remote(**kwargs)
     elif model == "uma":
-        result = UmaModel().calculate_softening_factor.remote(data=data, model_name=variant)
+        result = UmaModel().calculate_softening_factor.remote(**kwargs)
     elif model == "tensornet":
-        result = TensorNetModel().calculate_softening_factor.remote(data=data, model_name=variant)
+        result = TensorNetModel().calculate_softening_factor.remote(**kwargs)
     elif model == "mattersim":
-        result = MatterSimModel().calculate_softening_factor.remote(data=data, model_name=variant)
+        result = MatterSimModel().calculate_softening_factor.remote(**kwargs)
     else:
         print(f"Unknown model: {model}. Available: mace, esen, uma, tensornet, mattersim")
         return
