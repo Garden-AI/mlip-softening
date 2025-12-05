@@ -143,7 +143,14 @@ def load_data(input_json_url: str, cache_dir: str, volume: modal.Volume) -> dict
         raise ValueError(f"Invalid input type: {type(input_json_url)}. Expected str (URL).")
     
     # Reload volume to ensure we see latest changes from other containers
-    volume.reload()
+    try:
+        volume.reload()
+    except RuntimeError as e:
+        # If open files prevent reload (e.g. logging from ML libraries), warn and proceed
+        if "open files" in str(e):
+            print(f"Warning: Could not reload volume due to open files: {e}", file=sys.stderr)
+        else:
+            raise e
     
     # Specific handling for the default URL to have a clean filename
     if input_json_url == "https://figshare.com/ndownloader/files/50005317":
@@ -413,7 +420,7 @@ class EsenModel:
         loaded_data = load_data(input_json_url, CACHE_DIR, volume=WEIGHTS_AND_DATA_VOLUME)
         return run_softening_analysis(self.calc, loaded_data)
 
-@app.cls(image=UMA_IMAGE, volumes={CACHE_DIR: WEIGHTS_AND_DATA_VOLUME}, timeout=3600, gpu="T4") #, secrets=[modal.Secret.from_name("huggingface-secret")])
+@app.cls(image=UMA_IMAGE, volumes={CACHE_DIR: WEIGHTS_AND_DATA_VOLUME}, timeout=3600, gpu="T4")
 class UmaModel:
     @modal.enter()
     def setup(self):
@@ -429,15 +436,25 @@ class UmaModel:
         import sys
         from fairchem.core import FAIRChemCalculator, pretrained_mlip
         
-        # os.environ["HF_TOKEN"] = os.environ.get("HF_TOKEN") 
+        # Reload volume to check for existing cached weights
+        WEIGHTS_AND_DATA_VOLUME.reload()
+        
+        # Configure HF to store cache in the volume
+        os.environ["HF_HOME"] = CACHE_DIR
+        
         print(f"Loading UMA model: {model_name}...", file=sys.stderr)
         
+        # This will download to CACHE_DIR if not present
         self.predictor = pretrained_mlip.get_predict_unit(model_name, device="cuda" if torch.cuda.is_available() else "cpu")
         self.calc = FAIRChemCalculator(self.predictor, task_name="omat")
         self.current_model_name = model_name
+        
+        # Persist downloaded weights to the volume
+        WEIGHTS_AND_DATA_VOLUME.commit()
+        print("UMA model weights committed to volume.", file=sys.stderr)
 
     @modal.method()
-    def calculate_softening_factor(self, input_json_url: str = "https://figshare.com/ndownloader/files/50005317", model_name: str = "uma-m-1p1") -> dict:
+    def calculate_softening_factor(self, input_json_url: str = "https://figshare.com/ndownloader/files/50005317", model_name: str = "uma-s-1p1") -> dict:
         self._load_model(model_name)
         loaded_data = load_data(input_json_url, CACHE_DIR, volume=WEIGHTS_AND_DATA_VOLUME)
         return run_softening_analysis(self.calc, loaded_data)
@@ -551,7 +568,7 @@ def main(model: str = "mace", input_json_url: str = None, variant: str = None, o
     if variant is None:
         if model == "mace": variant = "MACE-MP-0"
         elif model == "esen": variant = "esen_30m_oam.pt"
-        elif model == "uma": variant = "uma-m-1p1"
+        elif model == "uma": variant = "uma-s-1p1"
         elif model == "tensornet": variant = "TensorNet-MatPES-PBE-v2025.1-PES"
         elif model == "mattersim": variant = "mattersim-v1.0.0-5M.pth"
     
