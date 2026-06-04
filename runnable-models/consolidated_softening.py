@@ -24,6 +24,43 @@ MACE_VARIANTS = {
     "MACE-MPA-0": "https://github.com/ACEsuit/mace-mp/releases/download/mace_mpa_0/mace-mpa-0-medium.model",
     "MACE-OMAT-0": "https://github.com/ACEsuit/mace-mp/releases/download/mace_omat_0/mace-omat-0-medium.model",
     "MACE-MatPES-PBE-0": "https://github.com/ACEsuit/mace-foundations/releases/download/mace_matpes_0/MACE-matpes-pbe-omat-ft.model",
+    # MH-0 and MH-1 are both published under the mace_mh_1 release tag. They are
+    # multi-head models; the level of theory is chosen via the `head` parameter,
+    # so the variant name carries no head suffix.
+    "MACE-MH-0": "https://github.com/ACEsuit/mace-foundations/releases/download/mace_mh_1/mace-mh-0.model",
+    "MACE-MH-1": "https://github.com/ACEsuit/mace-foundations/releases/download/mace_mh_1/mace-mh-1.model",
+}
+
+# Multi-head models require an explicit head: they have NO 'default' head, so
+# mace_mp() raises if one is not supplied. omat_pbe (PBE/PBE+U) is the sensible
+# DEFAULT, but a caller can override it via the `head` parameter to match the
+# level of theory their softening reference data was generated at.
+MACE_HEADS = {
+    "MACE-MH-0": "omat_pbe",
+    "MACE-MH-1": "omat_pbe",
+}
+
+# Heads available in each multi-head model, by level of theory. Pass one of
+# these as the `head` argument to calculate_softening_factor() to override the
+# default. (Verified by introspecting the loaded models on Modal.)
+MACE_AVAILABLE_HEADS = {
+    "MACE-MH-0": [
+        "omat_pbe",        # PBE/PBE+U, general inorganic (default)
+        "matpes_r2scan",   # r2SCAN meta-GGA
+        "mp_pbe_refit_add",# Materials Project PBE refit
+        "omol",            # wB97M-VV10, molecules
+        "spice_wB97M",     # wB97M-D3(BJ), molecules
+        "oc20_usemppbe",   # PBE, surfaces/catalysis
+        "rgd1_b3lyp",      # B3LYP, reaction chemistry (MH-0 only)
+    ],
+    "MACE-MH-1": [
+        "omat_pbe",        # PBE/PBE+U, general inorganic (default)
+        "matpes_r2scan",   # r2SCAN meta-GGA
+        "mp_pbe_refit_add",# Materials Project PBE refit
+        "omol",            # wB97M-VV10, molecules
+        "spice_wB97M",     # wB97M-D3(BJ), molecules
+        "oc20_usemppbe",   # PBE, surfaces/catalysis
+    ],
 }
 
 # ==============================================================================
@@ -31,16 +68,30 @@ MACE_VARIANTS = {
 # ==============================================================================
 
 # 1. MACE Image
+def _download_mace_mh_weights():
+    # Bake the multi-head weights into the image so first-call latency is low.
+    from mace.calculators import mace_mp
+    for variant in ("MACE-MH-0", "MACE-MH-1"):
+        mace_mp(
+            model=MACE_VARIANTS[variant],
+            default_dtype="float64",
+            device="cpu",
+            head=MACE_HEADS[variant],
+        )
+
 MACE_IMAGE = (
     modal.Image.debian_slim(python_version="3.10")
     .uv_pip_install(
-        "mace-torch>=0.3.10",
-        "torch==2.2.2",
+        # mace-torch>=0.3.15 is REQUIRED for MACE-MH-0/1: the multi-head models
+        # were introduced in 0.3.15, which also fixed a multi-head heads bug.
+        "mace-torch>=0.3.15",
+        "torch==2.4.0",
         "ase",
         "scikit-learn",
         "numpy<2",
         "pymatgen",
     )
+    .run_function(_download_mace_mh_weights)
 )
 
 # 2. Fairchem (eSEN) Image
@@ -119,6 +170,26 @@ MATTERSIM_IMAGE = (
         "ase",
         "mattersim",
     )
+)
+
+# 6. PET (uPET) Image — requires Python 3.11+ and torch >= 2.8.0
+def _download_pet_weights():
+    from huggingface_hub import hf_hub_download
+    hf_hub_download(repo_id="lab-cosmo/upet", filename="models/pet-omat-xl-v1.0.0.ckpt")
+    hf_hub_download(repo_id="lab-cosmo/upet", filename="models/pet-oam-xl-v1.0.0.ckpt")
+
+PET_IMAGE = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("git", "wget", "build-essential")
+    .pip_install("uv")
+    .uv_pip_install(
+        "torch==2.8.0",
+        "upet",
+        "ase",
+        "scikit-learn",
+        "pymatgen",
+    )
+    .run_function(_download_pet_weights)
 )
 
 # ==============================================================================
@@ -334,24 +405,64 @@ class MaceModel:
     def setup(self):
         self.calc = None
         self.current_variant = None
+        self.current_head = None
 
-    def _load_model(self, variant: str):
+    def _load_model(self, variant: str, head: str = None):
         from mace.calculators import mace_mp
         import sys
-        
-        if self.calc is not None and self.current_variant == variant:
+
+        # Resolve the variant case-insensitively so a caller passing e.g.
+        # "mace-mh-1" still maps to the canonical "MACE-MH-1" entry (and thus its
+        # required default head) instead of silently falling through.
+        canonical = {k.lower(): k for k in MACE_VARIANTS}.get(variant.lower())
+        if canonical is None:
+            # Unknown variant: pass it straight to mace_mp -- it may be a
+            # built-in keyword ("medium") or a direct .model URL.
+            model_arg, default_head = variant, None
+        else:
+            model_arg, default_head = MACE_VARIANTS[canonical], MACE_HEADS.get(canonical)
+
+        # An explicit head argument overrides the model's default head. This lets
+        # collaborators match the head to the level of theory of their reference
+        # data (e.g. matpes_r2scan instead of the default omat_pbe).
+        effective_head = head if head is not None else default_head
+
+        # Cache by (variant, head): a head change must trigger a reload.
+        if self.calc is not None and self.current_variant == variant and self.current_head == effective_head:
             return
-        
-        # Resolve variant to URL or keyword
-        model_arg = MACE_VARIANTS.get(variant, variant)
-        print(f"Loading MACE model: {variant} ({model_arg})", file=sys.stderr)
-        
-        self.calc = mace_mp(model=model_arg, default_dtype="float64", device='cuda')
+
+        # Validate the requested head against the known list, so a typo gives a
+        # clear error up front rather than a deep mace_mp traceback.
+        if head is not None and canonical in MACE_AVAILABLE_HEADS:
+            valid = MACE_AVAILABLE_HEADS[canonical]
+            if head not in valid:
+                raise ValueError(
+                    f"Head '{head}' is not available for {canonical}. "
+                    f"Choose one of: {valid}"
+                )
+
+        print(f"Loading MACE model: {variant} -> {canonical or variant} ({model_arg}), head={effective_head}", file=sys.stderr)
+
+        kwargs = {"model": model_arg, "default_dtype": "float64", "device": "cuda"}
+        if effective_head:
+            kwargs["head"] = effective_head
+
+        self.calc = mace_mp(**kwargs)
         self.current_variant = variant
+        self.current_head = effective_head
 
     @modal.method()
-    def calculate_softening_factor(self, input_json_url: str = "https://figshare.com/ndownloader/files/50005317", model_name: str = "MACE-MP-0") -> dict:
-        self._load_model(model_name)
+    def calculate_softening_factor(self, input_json_url: str = "https://figshare.com/ndownloader/files/50005317", model_name: str = "MACE-MP-0", head: str = None) -> dict:
+        """Run the softening analysis.
+
+        Args:
+            input_json_url: URL to the JSON of WBM high-energy states.
+            model_name: MACE variant, e.g. "MACE-MH-1".
+            head: For multi-head models, the head to use (level of theory). If
+                None, the model's default head is used (omat_pbe for MH-0/MH-1).
+                See MACE_AVAILABLE_HEADS for the valid options per model.
+        """
+        self._load_model(model_name, head=head)
         loaded_data = load_data(input_json_url, CACHE_DIR, volume=WEIGHTS_AND_DATA_VOLUME)
         return run_softening_analysis(self.calc, loaded_data)
 
@@ -545,20 +656,46 @@ class MatterSimModel:
         loaded_data = load_data(input_json_url, CACHE_DIR, volume=WEIGHTS_AND_DATA_VOLUME)
         return run_softening_analysis(self.calc, loaded_data)
 
+@app.cls(image=PET_IMAGE, volumes={CACHE_DIR: WEIGHTS_AND_DATA_VOLUME}, timeout=3600, gpu="T4")
+class PetModel:
+    @modal.enter()
+    def setup(self):
+        self.calc = None
+        self.current_model_name = None
+
+    def _load_model(self, model_name: str):
+        if self.calc is not None and self.current_model_name == model_name:
+            return
+
+        from upet.calculator import UPETCalculator
+        import sys
+
+        print(f"Loading PET model: {model_name}...", file=sys.stderr)
+        self.calc = UPETCalculator(model=model_name, device="cuda")
+        self.current_model_name = model_name
+
+    @modal.method()
+    def calculate_softening_factor(self, input_json_url: str = "https://figshare.com/ndownloader/files/50005317", model_name: str = "pet-omat-xl") -> dict:
+        self._load_model(model_name)
+        loaded_data = load_data(input_json_url, CACHE_DIR, volume=WEIGHTS_AND_DATA_VOLUME)
+        return run_softening_analysis(self.calc, loaded_data)
+
 # ==============================================================================
 # ENTRYPOINT
 # ==============================================================================
 
 @app.local_entrypoint()
-def main(model: str = "mace", input_json_url: str = None, variant: str = None, output: str = None):
+def main(model: str = "mace", input_json_url: str = None, variant: str = None, output: str = None, head: str = None):
     """
     Run softening analysis for a specific model.
-    
+
     Args:
-        model: Model family (mace, esen, uma, tensornet, mattersim)
+        model: Model family (mace, esen, uma, tensornet, mattersim, pet)
         input_json_url: URL to remote JSON file. If None, defaults to the Figshare URL via the remote function.
         variant: Specific model variant/name to load. Defaults vary by model family.
         output: Path to save the result JSON. If None, defaults to {model}_{variant}_results.json
+        head: (MACE multi-head models only) the head / level of theory to use,
+            e.g. "omat_pbe" (default) or "matpes_r2scan". Ignored by other families.
     """
     import json
     import os
@@ -572,6 +709,7 @@ def main(model: str = "mace", input_json_url: str = None, variant: str = None, o
         elif model == "uma": variant = "uma-s-1p1"
         elif model == "tensornet": variant = "TensorNet-MatPES-PBE-v2025.1-PES"
         elif model == "mattersim": variant = "mattersim-v1.0.0-5M.pth"
+        elif model == "pet": variant = "pet-omat-xl"
     
     # Handle data input
     if input_json_url:
@@ -585,9 +723,12 @@ def main(model: str = "mace", input_json_url: str = None, variant: str = None, o
     kwargs = {"model_name": variant}
     if input_json_url is not None:
         kwargs["input_json_url"] = input_json_url
-        
+
     result = None
     if model == "mace":
+        if head is not None:
+            kwargs["head"] = head
+            print(f"Using MACE head override: {head}")
         result = MaceModel().calculate_softening_factor.remote(**kwargs)
     elif model == "esen":
         result = EsenModel().calculate_softening_factor.remote(**kwargs)
@@ -597,8 +738,10 @@ def main(model: str = "mace", input_json_url: str = None, variant: str = None, o
         result = TensorNetModel().calculate_softening_factor.remote(**kwargs)
     elif model == "mattersim":
         result = MatterSimModel().calculate_softening_factor.remote(**kwargs)
+    elif model == "pet":
+        result = PetModel().calculate_softening_factor.remote(**kwargs)
     else:
-        print(f"Unknown model: {model}. Available: mace, esen, uma, tensornet, mattersim")
+        print(f"Unknown model: {model}. Available: mace, esen, uma, tensornet, mattersim, pet")
         return
 
     if result:
@@ -614,9 +757,11 @@ def main(model: str = "mace", input_json_url: str = None, variant: str = None, o
             if i >= 5: break
             print(f"{mid}: Slope={stats['slope']:.3f}, MAE={stats['mae']:.3f}, cMAE={stats['cmae']:.3f}")
             
-        # Save results to file
+        # Save results to file (include head in the name so a non-default head
+        # doesn't overwrite the default-head results).
         if output is None:
-            output = f"{model}_{variant.replace('/', '_')}_results.json"
+            head_tag = f"_{head}" if (model == "mace" and head is not None) else ""
+            output = f"{model}_{variant.replace('/', '_')}{head_tag}_results.json"
             
         print(f"\nSaving results to {output}...")
         with open(output, 'w') as f:
